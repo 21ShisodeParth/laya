@@ -2053,6 +2053,10 @@ class Agent(HookRegistry):
         ids = list(questions)
         if not ids and return_state_cache:
             raise ValueError("there is no state cache to return when questions is empty")
+        if not ids and state_cache is not None:
+            raise ValueError("there are no questions to use the supplied state cache")
+        if k is not None and (not isinstance(k, int) or isinstance(k, bool) or not 0 <= k <= len(ids)):
+            raise ValueError("k must be an integer between 0 and the number of questions")
         if return_state_cache and (k is None or k != 0 or execution != "cached"):
             raise ValueError("return_state_cache is only available with k=0 and execution='cached'")
         if state_cache is not None and (k != 0 or execution != "cached"):
@@ -2062,8 +2066,6 @@ class Agent(HookRegistry):
                 raise ValueError("k=n uses the baseline; set execution='grouped'")
             return self.system_one(state, questions, max_len=max_len, head_max_len=head_max_len,
                                    lang=lang, min_confidence=min_confidence)
-        if not isinstance(k, int) or isinstance(k, bool) or not 0 <= k < len(ids):
-            raise ValueError("k must be between 0 and the number of questions")
         if execution not in ("grouped", "mask_only", "cached"):
             raise ValueError("execution must be 'grouped', 'mask_only', or 'cached'")
         if k == 0 and execution == "grouped":

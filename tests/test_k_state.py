@@ -110,6 +110,12 @@ def test_k_equals_question_count_delegates_to_the_original_prediction_path():
     assert result is expected
     assert calls == [("state", questions, {"max_len": None, "head_max_len": None,
                                            "lang": None, "min_confidence": None})]
+    try:
+        agent.predict_k_state("state", questions, k=True)
+    except ValueError as exc:
+        assert "integer" in str(exc)
+    else:
+        raise AssertionError("bool must not be accepted as a question count")
 
 
 def test_two_pass_k0_matches_asymmetric_reference():

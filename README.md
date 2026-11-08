@@ -364,6 +364,8 @@ cannot run the tests or harness; install the project dependencies first.
    loaded checkpoint attention configuration.
 7. Documented modes, limits, and current verification status here. Ordinary `predict()` behavior
    and checkpoint files were not changed.
+8. Tightened input validation so booleans cannot act as integer k values, and made cache reuse
+   reject empty-question calls.
 
 ## Where to go next
 

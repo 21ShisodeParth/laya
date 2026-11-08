@@ -1,3 +1,124 @@
+# Fork experiment: k-state encoding
+
+> This section documents fork-specific experimental code. The upstream Laya README begins below the divider.
+
+---
+
+## Design and implementation
+
+This fork adds an experimental way to encode one state with fewer question-conditioned encoder
+passes. It is isolated from the upstream Laya documentation below. Ordinary `Agent.predict()` and
+`predict_batch()` behavior remains unchanged; use the opt-in `Agent.predict_k_state()` method.
+
+### Design and current implementation
+
+| area | implementation | status |
+|---|---|---|
+| Question grouping | `laya/k_state.py`: order, seeded random, character-trigram cosine, and bounded exhaustive oracle grouping | Implemented as standalone helpers |
+| Packed sequences | One shared state suffix, per-question marker routing, packed or head-local position IDs, and explicit truncation counts | Implemented as layout helper |
+| Encoder masks | Full and block-diagonal grouped masks; asymmetric query-unaware reference masks with ModernBERT local-window support | Implemented as mask helpers; requires runtime validation on Transformers 5 |
+| K/V cache | `encode_state_kv()` captures post-RoPE K/V per layer; `encode_head_with_state_cache()` reuses them; `encode_query_unaware_reference()` is the one-pass asymmetric reference | Implemented for Transformers 5 ModernBERT SDPA |
+| Agent integration | `Agent.predict_k_state()` dispatches grouped, mask-only k=0, cached k=0, and exact baseline k=n paths | Implemented as an opt-in eager-only API |
+| Layer cutoff | Apply query-unaware masks only in the first L encoder layers | Not implemented |
+| Profiling | `bench/k_state.py` profiles baseline, grouped, mask-only k=0, and cached k=0 | Harness implemented; T4 measurements pending |
+
+The `oracle` grouping method is limited to eight questions by default because it enumerates
+balanced assignments. Cosine grouping uses normalized character trigrams and has no embedding
+model dependency. The mask helpers return boolean masks for correctness experiments; they do not
+promise a particular SDPA kernel. For a T4 measurement, use the same checkpoint, precision, state
+and head lengths for every variant, then record the selected attention kernel rather than assuming
+that an explicit mask stays on Flash Attention. `predict_k_state()` currently requires an eager
+Hugging Face ModernBERT configured for SDPA under Transformers 5; it does not run prediction hooks,
+the TileLang backend, or `torch.compile`. State positions in the cached k=0 path start at zero and
+head positions start after the cached state, so one state cache can serve questions of different
+lengths. The experimental method is not used by ordinary `predict()` calls.
+
+With `position_mode="head_local"`, every packed head starts its RoPE positions at zero and the shared
+state starts after the longest head; with `position_mode="packed"`, positions follow the physical
+concatenation. Because there is one shared state, it cannot take a different position offset for
+each question. The layer-cutoff experiment is deferred until full-depth grouped and cached parity
+has been checked.
+
+```python
+# Experimental grouped encoder rows; every question is still scored independently downstream.
+result = agent.predict_k_state(state, questions, k=2, grouping="cosine",
+                               within_group="block_diagonal")
+
+# k=0 one-pass reference and two-pass reusable state cache.
+reference = agent.predict_k_state(state, questions, k=0, execution="mask_only")
+cached, state_cache = agent.predict_k_state(
+    state, questions, k=0, execution="cached", return_state_cache=True
+)
+# Reuse the same encoded state with another question set. The cache is valid only
+# for the same model and the same effective (post-truncation) state token IDs.
+more_answers = agent.predict_k_state(
+    state, more_questions, k=0, execution="cached", state_cache=state_cache
+)
+```
+
+### Runnable checks
+
+On a CUDA machine with a checkpoint available, inspect the default one-row-per-question
+batching and print the encoder config with:
+
+```bash
+python bench/k_state_baseline.py --model convaiinnovations/laya --device cuda
+```
+
+The script installs a forward pre-hook and reports actual input shapes for one and ten questions.
+It also prints the loaded attention implementation, RoPE config, layer types, and sliding-window
+size so those checkpoint-specific settings are measured rather than inferred.
+
+`python -m pytest tests/test_k_state.py` checks grouping, mask permissions, state truncation, marker
+routing, exact baseline delegation at k=n, and (under Transformers 5) two-pass k=0 parity against
+the asymmetric reference.
+`python tests/test_hooks_api.py` pins the new opt-in method's public signature. The T4 profiling
+harness is `bench/k_state.py`; it sweeps question count, state length, and group count, runs fp16
+CUDA event timing with 10 warmups and 50 timed iterations by default, tracks peak CUDA allocation
+and cached K/V bytes, prints observed SDPA profiler operators, and exports one Chrome trace per
+variant. For a quick smoke profile on a T4, run:
+
+```bash
+python bench/k_state.py --quick
+```
+
+Run the full sweeps with:
+
+```bash
+python bench/k_state.py --output bench/k_state_results.csv --traces bench/traces/k_state
+```
+
+This controlled synthetic encoder uses RoPE and alternating global/local attention masks to
+compare token-compute shapes. It does not use Laya's checkpoint weights or reproduce ModernBERT's
+exact implementation, so use it for harness/kernel-path checks only; accuracy and final latency
+claims require the checkpoint-level parity checks and T4 profiler runs. A checkout without PyTorch
+cannot run the tests or harness; install the project dependencies first.
+
+### Change log
+
+1. Added `laya/k_state.py` with deterministic grouping, packed input layout, ModernBERT full/local
+   attention masks, asymmetric k=0 reference, post-RoPE K/V capture/reuse, marker routing, and cache
+   byte accounting.
+2. Added `DecisionModel.forward_from_hidden()` so packed encoder features can pass through the
+   existing scoring head without changing the ordinary forward path.
+3. Added `Agent.predict_k_state()` as a separate opt-in entry point. `k=None` and `k=n` delegate to
+   `system_one()`; grouped k>=1 and both k=0 modes use the experimental implementation.
+4. Added `tests/test_k_state.py` and pinned the new entry point in `tests/test_hooks_api.py`.
+5. Added `bench/k_state.py` for controlled fp16 CUDA timing, memory/cache accounting, kernel
+   reporting, profiler ranges, and Chrome traces.
+6. Added `bench/k_state_baseline.py` to capture one- and ten-question encoder input shapes and the
+   loaded checkpoint attention configuration.
+7. Documented modes, limits, and current verification status here. Ordinary `predict()` behavior
+   and checkpoint files were not changed.
+8. Tightened input validation so booleans cannot act as integer k values, and made cache reuse
+   reject empty-question calls.
+9. Moved this fork's experiment to the top and separated it from the preserved upstream README.
+
+
+---
+
+# Upstream Laya README
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/NandhaKishorM/laya/main/assets/logo-lockup-dark.png" />
@@ -258,114 +379,6 @@ The shipped checkpoints work zero-shot, but fine-tuning on decisions from your o
   no duration no longer crashes the banner fallback (#1478), and a malformed policy manifest is
   a `PolicyError` (#1487). Loading a trained policy and how routing works are in
   [docs/vegaml.md](https://github.com/NandhaKishorM/laya/blob/main/docs/vegaml.md).
-
-## Experimental: k-state encoding
-
-This branch explores encoding one state with fewer question-conditioned encoder passes. The
-standard `Agent.predict()` and `predict_batch()` behavior remains unchanged. The experimental path
-is available only through the separate `Agent.predict_k_state()` method.
-
-### Design and current implementation
-
-| area | implementation | status |
-|---|---|---|
-| Question grouping | `laya/k_state.py`: order, seeded random, character-trigram cosine, and bounded exhaustive oracle grouping | Implemented as standalone helpers |
-| Packed sequences | One shared state suffix, per-question marker routing, packed or head-local position IDs, and explicit truncation counts | Implemented as layout helper |
-| Encoder masks | Full and block-diagonal grouped masks; asymmetric query-unaware reference masks with ModernBERT local-window support | Implemented as mask helpers; requires runtime validation on Transformers 5 |
-| K/V cache | `encode_state_kv()` captures post-RoPE K/V per layer; `encode_head_with_state_cache()` reuses them; `encode_query_unaware_reference()` is the one-pass asymmetric reference | Implemented for Transformers 5 ModernBERT SDPA |
-| Agent integration | `Agent.predict_k_state()` dispatches grouped, mask-only k=0, cached k=0, and exact baseline k=n paths | Implemented as an opt-in eager-only API |
-| Layer cutoff | Apply query-unaware masks only in the first L encoder layers | Not implemented |
-| Profiling | `bench/k_state.py` profiles baseline, grouped, mask-only k=0, and cached k=0 | Harness implemented; T4 measurements pending |
-
-The `oracle` grouping method is limited to eight questions by default because it enumerates
-balanced assignments. Cosine grouping uses normalized character trigrams and has no embedding
-model dependency. The mask helpers return boolean masks for correctness experiments; they do not
-promise a particular SDPA kernel. For a T4 measurement, use the same checkpoint, precision, state
-and head lengths for every variant, then record the selected attention kernel rather than assuming
-that an explicit mask stays on Flash Attention. `predict_k_state()` currently requires an eager
-Hugging Face ModernBERT configured for SDPA under Transformers 5; it does not run prediction hooks,
-the TileLang backend, or `torch.compile`. State positions in the cached k=0 path start at zero and
-head positions start after the cached state, so one state cache can serve questions of different
-lengths. The experimental method is not used by ordinary `predict()` calls.
-With `position_mode="head_local"`, every packed head starts its RoPE positions at zero and the shared
-state starts after the longest head; with `position_mode="packed"`, positions follow the physical
-concatenation. Because there is one shared state, it cannot take a different position offset for
-each question. The layer-cutoff experiment is deferred until full-depth grouped and cached parity
-has been checked.
-
-```python
-# Experimental grouped encoder rows; every question is still scored independently downstream.
-result = agent.predict_k_state(state, questions, k=2, grouping="cosine",
-                               within_group="block_diagonal")
-
-# k=0 one-pass reference and two-pass reusable state cache.
-reference = agent.predict_k_state(state, questions, k=0, execution="mask_only")
-cached, state_cache = agent.predict_k_state(
-    state, questions, k=0, execution="cached", return_state_cache=True
-)
-# Reuse the same encoded state with another question set. The cache is valid only
-# for the same model and the same effective (post-truncation) state token IDs.
-more_answers = agent.predict_k_state(
-    state, more_questions, k=0, execution="cached", state_cache=state_cache
-)
-```
-
-### Runnable checks
-
-On a CUDA machine with a checkpoint available, inspect the default one-row-per-question
-batching and print the encoder config with:
-
-```bash
-python bench/k_state_baseline.py --model convaiinnovations/laya --device cuda
-```
-
-The script installs a forward pre-hook and reports actual input shapes for one and ten questions.
-It also prints the loaded attention implementation, RoPE config, layer types, and sliding-window
-size so those checkpoint-specific settings are measured rather than inferred.
-
-`python -m pytest tests/test_k_state.py` checks grouping, mask permissions, state truncation, marker
-routing, exact baseline delegation at k=n, and (under Transformers 5) two-pass k=0 parity against
-the asymmetric reference.
-`python tests/test_hooks_api.py` pins the new opt-in method's public signature. The T4 profiling
-harness is `bench/k_state.py`; it sweeps question count, state length, and group count, runs fp16
-CUDA event timing with 10 warmups and 50 timed iterations by default, tracks peak CUDA allocation
-and cached K/V bytes, prints observed SDPA profiler operators, and exports one Chrome trace per
-variant. For a quick smoke profile on a T4, run:
-
-```bash
-python bench/k_state.py --quick
-```
-
-Run the full sweeps with:
-
-```bash
-python bench/k_state.py --output bench/k_state_results.csv --traces bench/traces/k_state
-```
-
-This controlled synthetic encoder uses RoPE and alternating global/local attention masks to
-compare token-compute shapes. It does not use Laya's checkpoint weights or reproduce ModernBERT's
-exact implementation, so use it for harness/kernel-path checks only; accuracy and final latency
-claims require the checkpoint-level parity checks and T4 profiler runs. A checkout without PyTorch
-cannot run the tests or harness; install the project dependencies first.
-
-### Change log
-
-1. Added `laya/k_state.py` with deterministic grouping, packed input layout, ModernBERT full/local
-   attention masks, asymmetric k=0 reference, post-RoPE K/V capture/reuse, marker routing, and cache
-   byte accounting.
-2. Added `DecisionModel.forward_from_hidden()` so packed encoder features can pass through the
-   existing scoring head without changing the ordinary forward path.
-3. Added `Agent.predict_k_state()` as a separate opt-in entry point. `k=None` and `k=n` delegate to
-   `system_one()`; grouped k>=1 and both k=0 modes use the experimental implementation.
-4. Added `tests/test_k_state.py` and pinned the new entry point in `tests/test_hooks_api.py`.
-5. Added `bench/k_state.py` for controlled fp16 CUDA timing, memory/cache accounting, kernel
-   reporting, profiler ranges, and Chrome traces.
-6. Added `bench/k_state_baseline.py` to capture one- and ten-question encoder input shapes and the
-   loaded checkpoint attention configuration.
-7. Documented modes, limits, and current verification status here. Ordinary `predict()` behavior
-   and checkpoint files were not changed.
-8. Tightened input validation so booleans cannot act as integer k values, and made cache reuse
-   reject empty-question calls.
 
 ## Where to go next
 

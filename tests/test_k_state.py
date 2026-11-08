@@ -26,6 +26,9 @@ def test_oracle_grouping_is_bounded_and_covers_questions():
     texts = ["refund", "invoice", "bug", "crash"]
     groups = group_questions(texts, 2, method="oracle")
     assert sorted(index for group in groups for index in group) == list(range(4))
+    assert sorted(map(len, groups)) == [2, 2]
+    near_limit = group_questions(["question %d" % i for i in range(8)], 7, method="oracle")
+    assert sorted(map(len, near_limit)) == [1, 1, 1, 1, 1, 1, 2]
     try:
         group_questions(texts * 3, 2, method="oracle")
     except ValueError as exc:

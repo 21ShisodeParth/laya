@@ -275,7 +275,7 @@ is available only through the separate `Agent.predict_k_state()` method.
 | K/V cache | `encode_state_kv()` captures post-RoPE K/V per layer; `encode_head_with_state_cache()` reuses them; `encode_query_unaware_reference()` is the one-pass asymmetric reference | Implemented for Transformers 5 ModernBERT SDPA |
 | Agent integration | `Agent.predict_k_state()` dispatches grouped, mask-only k=0, cached k=0, and exact baseline k=n paths | Implemented as an opt-in eager-only API |
 | Layer cutoff | Apply query-unaware masks only in the first L encoder layers | Not implemented |
-| Profiling | No k-state benchmark results are included yet | Harness pending |
+| Profiling | `bench/k_state.py` profiles baseline, grouped, mask-only k=0, and cached k=0 | Harness implemented; T4 measurements pending |
 
 The `oracle` grouping method is limited to eight questions by default because it enumerates
 balanced assignments. Cosine grouping uses normalized character trigrams and has no embedding

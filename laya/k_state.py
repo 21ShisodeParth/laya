@@ -5,7 +5,6 @@ Its grouped execution helpers and ModernBERT K/V path are experimental and requi
 checkpoint-level parity checks before their results are treated as production output.
 """
 from dataclasses import dataclass
-from itertools import product
 import math
 import random
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -71,12 +70,29 @@ def _cosine(a: Dict[str, float], b: Dict[str, float]) -> float:
 def _balanced_assignments(n: int, k: int):
     """Yield restricted-growth labels with group sizes differing by at most one."""
     target_sizes = sorted((n // k + (i < n % k) for i in range(k)), reverse=True)
-    for labels in product(range(k), repeat=n):
-        if labels[0] != 0 or set(labels) != set(range(k)):
-            continue
-        sizes = [labels.count(group) for group in range(k)]
-        if sorted(sizes, reverse=True) == target_sizes:
-            yield labels
+
+    def extend(labels, sizes):
+        if len(labels) == n:
+            yield tuple(labels)
+            return
+        # Restricted-growth labels create each unlabeled partition only once.
+        upper = min(k, len(sizes) + 1)
+        for group in range(upper):
+            if group == len(sizes):
+                sizes.append(0)
+            if sizes[group] >= target_sizes[group]:
+                if group == len(sizes) - 1 and sizes[group] == 0:
+                    sizes.pop()
+                continue
+            sizes[group] += 1
+            labels.append(group)
+            yield from extend(labels, sizes)
+            labels.pop()
+            sizes[group] -= 1
+            if group == len(sizes) - 1 and sizes[group] == 0:
+                sizes.pop()
+
+    yield from extend([0], [1])
 
 
 def group_questions(texts: Sequence[str], k: int, method: str = "order", seed: int = 0,

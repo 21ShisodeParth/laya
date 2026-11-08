@@ -1,10 +1,14 @@
 """Run ordinary Laya prediction with an encoder pre-hook for 1 and 10 questions."""
 import argparse
 import json
+import os
 import platform
+import sys
 
 import torch
 import transformers
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from laya import Agent
 

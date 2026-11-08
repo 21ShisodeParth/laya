@@ -21,6 +21,10 @@ flowchart TB
     S2["S + Q₂"] --> A2["Answer 2"]
     S3["S + Q₃"] --> A3["Answer 3"]
   end
+  subgraph K2["k = 2 · two groups share two state encodings"]
+    G1["S + Q₁ + Q₂"] --> C1["Answers 1, 2"]
+    G2["S + Q₃"] --> C2["Answer 3"]
+  end
   subgraph K1["k = 1 · all question heads share one state encoding"]
     G["S + Q₁ + Q₂ + Q₃"] --> B["Answers 1, 2, 3"]
   end
@@ -51,6 +55,8 @@ Question-head work:    k=n  █          k=1  █     k=0  █
 | Profiling | `bench/k_state.py` profiles baseline, grouped, mask-only k=0, and cached k=0 | Harness implemented; T4 measurements pending |
 
 The `oracle` grouping method is limited to eight questions by default because it enumerates balanced assignments. Cosine grouping uses normalized character trigrams and has no embedding model dependency.
+
+Grouping can keep related questions together so a shared state representation is conditioned by questions with overlapping topics, while separating unrelated questions that might compete for attention or change one another's context. For example, cosine similarity between question-text vectors can form groups of semantically similar questions; this is an experiment to compare against order-based or random grouping, not a guaranteed accuracy improvement.
 
 The mask helpers return boolean masks for correctness experiments; they do not promise a particular SDPA kernel. For a T4 measurement, use the same checkpoint, precision, state and head lengths for every variant. Record the selected attention kernel rather than assuming an explicit mask stays on Flash Attention.
 

@@ -10,6 +10,34 @@ This fork adds an experimental way to encode one state with fewer question-condi
 passes. It is isolated from the upstream Laya documentation below. Ordinary `Agent.predict()` and
 `predict_batch()` behavior remains unchanged; use the opt-in `Agent.predict_k_state()` method.
 
+### Concept, visually
+
+Each box below is one encoder pass. `S` is the state; `Qᵢ` is a question head. Lower `k` reuses the state representation across more questions.
+
+```mermaid
+flowchart TB
+  subgraph KN["k = n · one state encoding per question"]
+    S1["S + Q₁"] --> A1["Answer 1"]
+    S2["S + Q₂"] --> A2["Answer 2"]
+    S3["S + Q₃"] --> A3["Answer 3"]
+  end
+  subgraph K1["k = 1 · all question heads share one state encoding"]
+    G["S + Q₁ + Q₂ + Q₃"] --> B["Answers 1, 2, 3"]
+  end
+  subgraph K0["k = 0 · state encoded without questions; cached representation reused"]
+    S["S"] --> C["cached state"]
+    C --> H1["Q₁ + cache → Answer 1"]
+    C --> H2["Q₂ + cache → Answer 2"]
+    C --> H3["Q₃ + cache → Answer 3"]
+  end
+```
+
+```text
+Repeated state work:   k=n  ██████████   k=1  ███   k=0  █
+Question-head work:    k=n  █          k=1  █     k=0  █
+                       (illustrative; actual cost depends on sequence lengths and attention)
+```
+
 ### Design and current implementation
 
 | area | implementation | status |
@@ -22,22 +50,17 @@ passes. It is isolated from the upstream Laya documentation below. Ordinary `Age
 | Layer cutoff | Apply query-unaware masks only in the first L encoder layers | Not implemented |
 | Profiling | `bench/k_state.py` profiles baseline, grouped, mask-only k=0, and cached k=0 | Harness implemented; T4 measurements pending |
 
-The `oracle` grouping method is limited to eight questions by default because it enumerates
-balanced assignments. Cosine grouping uses normalized character trigrams and has no embedding
-model dependency. The mask helpers return boolean masks for correctness experiments; they do not
-promise a particular SDPA kernel. For a T4 measurement, use the same checkpoint, precision, state
-and head lengths for every variant, then record the selected attention kernel rather than assuming
-that an explicit mask stays on Flash Attention. `predict_k_state()` currently requires an eager
-Hugging Face ModernBERT configured for SDPA under Transformers 5; it does not run prediction hooks,
-the TileLang backend, or `torch.compile`. State positions in the cached k=0 path start at zero and
-head positions start after the cached state, so one state cache can serve questions of different
-lengths. The experimental method is not used by ordinary `predict()` calls.
+The `oracle` grouping method is limited to eight questions by default because it enumerates balanced assignments. Cosine grouping uses normalized character trigrams and has no embedding model dependency.
 
-With `position_mode="head_local"`, every packed head starts its RoPE positions at zero and the shared
-state starts after the longest head; with `position_mode="packed"`, positions follow the physical
-concatenation. Because there is one shared state, it cannot take a different position offset for
-each question. The layer-cutoff experiment is deferred until full-depth grouped and cached parity
-has been checked.
+The mask helpers return boolean masks for correctness experiments; they do not promise a particular SDPA kernel. For a T4 measurement, use the same checkpoint, precision, state and head lengths for every variant. Record the selected attention kernel rather than assuming an explicit mask stays on Flash Attention.
+
+`predict_k_state()` currently requires an eager Hugging Face ModernBERT configured for SDPA under Transformers 5. It does not run prediction hooks, the TileLang backend, or `torch.compile`.
+
+State positions in the cached k=0 path start at zero and head positions start after the cached state. One state cache can therefore serve questions of different lengths. The experimental method is not used by ordinary `predict()` calls.
+
+With `position_mode="head_local"`, every packed head starts its RoPE positions at zero and the shared state starts after the longest head. With `position_mode="packed"`, positions follow the physical concatenation. Because there is one shared state, it cannot take a different position offset for each question.
+
+The layer-cutoff experiment is deferred until full-depth grouped and cached parity has been checked.
 
 ```python
 # Experimental grouped encoder rows; every question is still scored independently downstream.

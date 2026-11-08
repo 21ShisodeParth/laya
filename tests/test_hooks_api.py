@@ -253,6 +253,13 @@ for label, fn in (("Agent.predict_long", Agent.predict_long),
 
 check_param("Agent.predict_batch", Agent.predict_batch, "batch_size", None)
 check_param("Agent.predict_batch", Agent.predict_batch, "sort_by_length", False)
+check_true("Agent.predict_k_state is the explicit experimental entry point",
+           callable(getattr(Agent, "predict_k_state", None)))
+for param, default in (("k", None), ("grouping", "order"), ("seed", 0),
+                       ("within_group", "full"), ("position_mode", "packed"),
+                       ("execution", "grouped"), ("state_cache", None), ("return_state_cache", False)):
+    check_param("Agent.predict_k_state", Agent.predict_k_state, param, default,
+                inspect.Parameter.KEYWORD_ONLY)
 check_param("Router.predict_batch", Router.predict_batch, "batch_size", None)
 check_param("Router.predict_batch", Router.predict_batch, "sort_by_length", False)
 # the #1111 report: an out-dict the batch fills with the per-group sort outcome

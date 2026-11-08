@@ -783,6 +783,12 @@ class DecisionModel(nn.Module):
             masks = parallel_option_masks(attention_mask, position_ids, option_ids,
                                           getattr(self.encoder.config, "sliding_window", None))
             h = self.encoder(input_ids=input_ids, attention_mask=masks, position_ids=position_ids).last_hidden_state
+        return self.forward_from_hidden(h, attention_mask, marker_pos, marker_mask, qtype,
+                                        detach_encoder=detach_encoder)
+
+    def forward_from_hidden(self, h, attention_mask, marker_pos, marker_mask, qtype,
+                            detach_encoder: bool = False):
+        """Run the existing decision head over encoder states supplied by an experiment."""
         if detach_encoder:
             h = h.detach()
         h = h + self.type_emb(qtype)[:, None, :]

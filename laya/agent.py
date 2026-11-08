@@ -29,6 +29,7 @@ from .common import (
     TEMP_MIN,
     amp_dtype,
     build_model,
+    build_head,
     build_sequence,
     collapsed_options,
     clamp_temperature,
@@ -40,6 +41,7 @@ from .common import (
     _reuse_question_tokens,
     _disable_question_token_reuse,
     encode_text,
+    render_options,
     render_criterion,
     resolve_lang_temperatures,
     serialize_state,
@@ -2024,6 +2026,202 @@ class Agent(HookRegistry):
                                   hooks_timeout=hooks_timeout,
                                   max_len=max_len, head_max_len=head_max_len,
                                   min_confidence=min_confidence)[0]
+
+    @torch.no_grad()
+    def predict_k_state(self, state: Union[str, dict, list], questions: Dict[str, Dict[str, Any]], *,
+                        k: Optional[int] = None, grouping: str = "order", seed: int = 0,
+                        within_group: str = "full", position_mode: str = "packed",
+                        execution: str = "grouped", state_cache=None, return_state_cache: bool = False,
+                        max_len: Optional[int] = None, head_max_len: Optional[int] = None,
+                        lang: Optional[str] = None, min_confidence: Optional[float] = None):
+        """Experimental k-state inference; standard ``predict`` remains unchanged.
+
+        ``k=None`` or ``k=n`` delegates to the ordinary path exactly. For ``1 <= k < n``,
+        questions are packed into k encoder rows. For k=0, ``execution`` selects the
+        asymmetric one-pass reference or the reusable two-pass K/V implementation.
+        This experimental entry point currently requires the eager backend and
+        Transformers 5 ModernBERT.
+        """
+        from .k_state import (
+            StateKVCache, encode_head_with_state_cache,
+            encode_packed_groups, encode_query_unaware_reference, encode_state_kv,
+            group_questions, pack_group,
+        )
+
+        if not isinstance(questions, dict):
+            raise TypeError("questions must be a dict of question id -> question definition")
+        ids = list(questions)
+        if not ids and return_state_cache:
+            raise ValueError("there is no state cache to return when questions is empty")
+        if return_state_cache and (k is None or k != 0 or execution != "cached"):
+            raise ValueError("return_state_cache is only available with k=0 and execution='cached'")
+        if state_cache is not None and (k != 0 or execution != "cached"):
+            raise ValueError("state_cache is only accepted with k=0 and execution='cached'")
+        if k is None or k == len(ids):
+            if execution != "grouped":
+                raise ValueError("k=n uses the baseline; set execution='grouped'")
+            return self.system_one(state, questions, max_len=max_len, head_max_len=head_max_len,
+                                   lang=lang, min_confidence=min_confidence)
+        if not isinstance(k, int) or isinstance(k, bool) or not 0 <= k < len(ids):
+            raise ValueError("k must be between 0 and the number of questions")
+        if execution not in ("grouped", "mask_only", "cached"):
+            raise ValueError("execution must be 'grouped', 'mask_only', or 'cached'")
+        if k == 0 and execution == "grouped":
+            raise ValueError("k=0 requires execution='mask_only' or execution='cached'")
+        if k > 0 and execution != "grouped":
+            raise ValueError("mask_only and cached execution are only defined for k=0")
+        if (getattr(self, "_fast", None) is not None or getattr(self, "_compiled", False)
+                or getattr(getattr(self, "_backend", None), "name", "eager") != "eager"):
+            raise ValueError("predict_k_state currently requires the eager backend")
+        if getattr(self, "parallel_options", False):
+            raise ValueError("predict_k_state currently supports sequential-option checkpoints only")
+        if not ids:
+            return {"model": "laya-rl-agent", "answers": {},
+                    "usage": {"input_tokens": 0, "output_tokens": 0}}
+        if state is None:
+            raise TypeError("state must not be None; pass a string, dict, or list")
+
+        max_len = self.cfg.get("max_len", 512) if max_len is None else max_len
+        head_max_len = self.cfg.get("head_max_len", 192) if head_max_len is None else head_max_len
+        internal = {}
+        heads, markers, option_stats = [], [], []
+        for qid in ids:
+            self._check_question(qid, questions[qid])
+            q = self._to_internal(questions[qid])
+            internal[qid] = q
+            head, marker, stats = build_head(self.tok, q, head_max_len,
+                                              option_order=q.get("option_order"))
+            heads.append(head)
+            markers.append(marker)
+            option_stats.append(stats)
+        if k == 0 and any(len(head) + 1 > max_len for head in heads):
+            raise ValueError("a question head leaves no room for the state closing token at max_len=%d"
+                             % max_len)
+        state_ids = list(encode_text(
+            self.tok, serialize_state(state).replace(self.tok.mask_token, " "),
+            add_special_tokens=False,
+        )["input_ids"])
+        truncate_left = isinstance(state, list)
+        original_state_length = len(state_ids)
+        question_texts = [q["t"] + " " + q["ins"] + " " + " ".join(render_options(q))
+                          for q in internal.values()]
+
+        groups = []
+        if k > 0:
+            assignment = group_questions(question_texts, k, method=grouping, seed=seed)
+            for group_indices in assignment:
+                packed = pack_group(
+                    group_indices, heads, markers, state_ids, self.tok.sep_token_id, max_len,
+                    position_mode=position_mode, within_group=within_group,
+                    truncate_left=truncate_left,
+                )
+                groups.append(packed)
+            dropped = max(group.state_tokens_dropped for group in groups)
+        else:
+            room = min(max(0, max_len - len(head) - 1) for head in heads)
+            state_ids = state_ids[-room:] if truncate_left and room else state_ids[:room]
+            if room == 0:
+                state_ids = []
+            dropped = original_state_length - len(state_ids)
+        if dropped:
+            warnings.warn("laya: k-state packing truncated %d state tokens to fit the shared heads"
+                          % dropped, RuntimeWarning, stacklevel=2)
+
+        model = self.model
+        device = self.device
+        readout_rows, row_items = [None] * len(ids), [None] * len(ids)
+        input_tokens = 0
+        if k > 0:
+            with _amp_context(device, self.dtype, self._amp_enabled_for(len(groups))):
+                encoded, valid, _, _ = encode_packed_groups(
+                    model.encoder, groups, self.tok.pad_token_id, within_group=within_group)
+            input_tokens = int(valid.sum().item())
+            for group_index, group in enumerate(groups):
+                state_hidden = encoded[group_index, group.state_span[0]:group.state_span[1]]
+                for local_index, qindex in enumerate(group.question_indices):
+                    start, end = group.question_spans[local_index]
+                    readout_rows[qindex] = torch.cat([encoded[group_index, start:end], state_hidden], dim=0)
+                    row_items[qindex] = {"markers": markers[qindex], "state_stats": {
+                        "state_tokens": len(state_ids), "state_tokens_used": group.state_tokens_used,
+                        "state_tokens_dropped": group.state_tokens_dropped,
+                        "truncated": group.state_tokens_dropped > 0,
+                    }, "options": option_stats[qindex]}
+        else:
+            if execution == "cached":
+                reused_cache = state_cache is not None
+                if state_cache is None:
+                    with _amp_context(device, self.dtype, self._amp_enabled_for(1)):
+                        state_cache = encode_state_kv(model.encoder,
+                                                      state_ids + [self.tok.sep_token_id], self.model_id)
+                if not isinstance(state_cache, StateKVCache):
+                    raise TypeError("state_cache must be a StateKVCache returned by encode_state_kv")
+                if state_cache.state_token_ids != tuple(state_ids + [self.tok.sep_token_id]):
+                    raise ValueError("state_cache token IDs do not match the truncated state")
+                if state_cache.model_id not in (None, self.model_id):
+                    raise ValueError("state_cache was encoded by a different Laya model")
+                if state_cache.position_ids != tuple(range(len(state_cache.state_token_ids))):
+                    raise ValueError("state_cache uses an unsupported state position convention")
+                if state_cache.final_hidden is None:
+                    raise ValueError("state_cache must include the encoded final state hidden states")
+                if state_cache.final_hidden.shape[1] != len(state_cache.state_token_ids):
+                    raise ValueError("state_cache hidden states do not match its state token count")
+            for qindex, (head, marker, stats) in enumerate(zip(heads, markers, option_stats)):
+                with _amp_context(device, self.dtype, self._amp_enabled_for(len(ids))):
+                    if execution == "cached":
+                        head_hidden = encode_head_with_state_cache(model.encoder, state_cache, head)[0]
+                        state_hidden = state_cache.final_hidden[0].to(device=device, dtype=head_hidden.dtype)
+                    else:
+                        state_hidden_batch, head_hidden_batch = encode_query_unaware_reference(
+                            model.encoder, state_ids + [self.tok.sep_token_id], head)
+                        state_hidden, head_hidden = state_hidden_batch[0], head_hidden_batch[0]
+                        input_tokens += len(state_ids) + 1 + len(head)
+                readout_rows[qindex] = torch.cat([head_hidden, state_hidden], dim=0)
+                row_items[qindex] = {"markers": marker, "state_stats": {
+                    "state_tokens": len(state_ids), "state_tokens_used": len(state_ids),
+                    "state_tokens_dropped": dropped, "truncated": dropped > 0,
+                }, "options": stats}
+            if execution == "cached":
+                input_tokens = (0 if reused_cache else len(state_ids) + 1) + sum(map(len, heads))
+
+        max_readout_len = max(row.shape[0] for row in readout_rows)
+        max_options = max(len(item["markers"]) for item in row_items)
+        hidden_size = readout_rows[0].shape[-1]
+        hidden = torch.zeros((len(ids), max_readout_len, hidden_size), device=device,
+                             dtype=readout_rows[0].dtype)
+        attention = torch.zeros((len(ids), max_readout_len), dtype=torch.long, device=device)
+        marker_pos = torch.zeros((len(ids), max_options), dtype=torch.long, device=device)
+        marker_mask = torch.zeros((len(ids), max_options), dtype=torch.bool, device=device)
+        qtype = torch.zeros((len(ids),), dtype=torch.long, device=device)
+        for row, (features, item, qid) in enumerate(zip(readout_rows, row_items, ids)):
+            length = features.shape[0]
+            hidden[row, :length] = features
+            attention[row, :length] = 1
+            count = len(item["markers"])
+            marker_pos[row, :count] = torch.tensor(item["markers"], dtype=torch.long, device=device)
+            marker_mask[row, :count] = True
+            qtype[row] = QTYPES[internal[qid]["t"]]
+        with _amp_context(device, self.dtype, self._amp_enabled_for(len(ids))):
+            logits, act_logits = model.forward_from_hidden(hidden, attention, marker_pos, marker_mask, qtype)
+        logits = logits.float().cpu().numpy()
+        act_probs = torch.softmax(act_logits.float(), -1).cpu().numpy()
+        answers = self._decode_answers(logits, act_probs, row_items, ids, internal, 0, lang=lang)
+        usage = {
+            "input_tokens": input_tokens,
+            "output_tokens": 0,
+            "state_tokens": original_state_length,
+            "state_tokens_dropped": dropped,
+            "truncated": dropped > 0,
+            "truncated_questions": [qid for qid, item in zip(ids, row_items)
+                                    if item["state_stats"]["truncated"]],
+            "k_state_groups": k,
+        }
+        collapsed = collapsed_options(ids, row_items)
+        if collapsed:
+            usage["options"] = collapsed
+        result = {"model": "laya-rl-agent", "answers": answers, "usage": usage}
+        apply_confidence_gate([result], check_min_confidence(min_confidence)
+                              if min_confidence is not None else None)
+        return (result, state_cache) if return_state_cache else result
 
     def __enter__(self):
         return self
